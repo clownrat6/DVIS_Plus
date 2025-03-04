@@ -127,9 +127,9 @@ class VideoMultiScaleMaskedTransformerDecoder_dvis(VideoMultiScaleMaskedTransfor
         for i in range(len(predictions_class)):
             predictions_class[i] = einops.rearrange(predictions_class[i], '(b t) q c -> b t q c', t=t)
 
-        pred_embds_without_norm = einops.rearrange(output, 'q (b t) c -> b c t q', t=t)
+        pred_embds_without_norm = einops.rearrange(output, 'q (b t) c -> t q b c', t=t)
         pred_embds = self.decoder_norm(output)
-        pred_embds = einops.rearrange(pred_embds, 'q (b t) c -> b c t q', t=t)
+        pred_embds = einops.rearrange(pred_embds, 'q (b t) c -> t q b c', t=t)
 
         out = {
             'pred_logits': predictions_class[-1],
@@ -334,11 +334,11 @@ class VideoMultiScaleMaskedTransformerDecoder_dvisPlus(VideoMultiScaleMaskedTran
         for i in range(len(predictions_class)):
             predictions_class[i] = einops.rearrange(predictions_class[i], '(b t) q c -> b t q c', t=t)
 
-        pred_embds_without_norm = einops.rearrange(output, 'q (b t) c -> b c t q', t=t)
+        pred_embds_without_norm = einops.rearrange(output, 'q (b t) c -> t q b c', t=t)
         pred_embds = self.decoder_norm(output)
         reid_embed = self.reid_embed(pred_embds)
-        pred_embds = einops.rearrange(pred_embds, 'q (b t) c -> b c t q', t=t)
-        reid_embed = einops.rearrange(reid_embed, 'q (b t) c -> b c t q', t=t)
+        pred_embds = einops.rearrange(pred_embds, 'q (b t) c -> t q b c', t=t)
+        reid_embed = einops.rearrange(reid_embed, 'q (b t) c -> t q b c', t=t)
 
         out = {
             'pred_logits': predictions_class[-1],
@@ -348,8 +348,8 @@ class VideoMultiScaleMaskedTransformerDecoder_dvisPlus(VideoMultiScaleMaskedTran
             ),
             # 'pred_embds': pred_embds,
             # 'pred_embds_without_norm': pred_embds_without_norm,
-            'pred_embds': torch.cat([pred_embds, reid_embed], dim=1),
-            'pred_embds_without_norm': torch.cat([pred_embds_without_norm, reid_embed], dim=1),
+            'pred_embds': torch.cat([pred_embds, reid_embed], dim=-1),
+            'pred_embds_without_norm': torch.cat([pred_embds_without_norm, reid_embed], dim=-1),
             'pred_reid_embed': reid_embed,
             'mask_features': mask_features
         }

@@ -184,6 +184,110 @@ class ReferringTracker_noiser(torch.nn.Module):
         self.last_reference = None
         return
 
+    def forward_decoder_layer(self, j, identity, tgt, key, memory):
+        output = self.transformer_cross_attention_layers[j](
+            identity, tgt, key, memory,
+            memory_mask=None,
+            memory_key_padding_mask=None,
+            pos=None, query_pos=None
+        )
+        output = self.transformer_self_attention_layers[j](
+            output, tgt_mask=None,
+            tgt_key_padding_mask=None,
+            query_pos=None
+        )
+        # FFN
+        output = self.transformer_ffn_layers[j](
+            output
+        )
+
+        return output
+
+    def forward_frame(self, cur_frame_embeds, cur_frame_embeds_no_norm, cur_frame_classes, mask_features, last_output=None):
+        frame_key = cur_frame_embeds_no_norm
+        frame_value = cur_frame_embeds_no_norm
+
+        first_frame = False
+        if last_output is None:
+            pre_frame_embeds = cur_frame_embeds
+            first_frame = True
+        else:
+            pre_frame_embeds = last_output['pred_embeds']
+            pre_tgt = last_output['tgts'][-1]
+
+        indices, noised_init = self.noiser(
+            pre_frame_embeds,
+            cur_frame_embeds,
+            cur_embeds_no_norm=cur_frame_embeds_no_norm,
+            activate=False,
+            cur_classes=cur_frame_classes,
+        )
+        ms_output = [cur_frame_embeds_no_norm[indices]]
+        pre_frame_embeds = cur_frame_embeds[indices]
+        ret_indices = [indices]
+
+        if first_frame:
+            for j in range(self.num_layers):
+                if j == 0:
+                    identity = noised_init
+                    tgt = reference = self.ref_proj(frame_key)
+                else:
+                    identity = ms_output[-1]
+                    tgt = self.ref_proj(ms_output[-1])
+                output = self.forward_decoder_layer(j, identity, tgt, frame_key, frame_value)
+                ms_output.append(output)
+        else:
+            for j in range(self.num_layers):
+                if j == 0:
+                    identity = noised_init
+                    tgt = reference = self.ref_proj(pre_tgt)
+                else:
+                    identity = ms_output[-1]
+                    tgt = tgt
+                output = self.forward_decoder_layer(j, identity, tgt, frame_key, frame_value)
+                ms_output.append(output)
+
+        ms_output = ms_output[1:]
+        ms_output = torch.stack(ms_output, dim=0)
+
+        output_class, output_mask = self.prediction(ms_output[None], mask_features, reference[None])
+
+        return {
+            'pred_logits': output_class[-1],  # (b, 1, q, c)
+            'pred_masks':  output_mask[-1],   # (b, q, 1, h, w)
+            'tgts':  ms_output, # (l, q, b, c)
+            'pred_embeds': pre_frame_embeds,
+            'pred_references': reference
+        }
+
+    def forward_frames(frame_embeds, mask_features, resume=False,
+        return_indices=False, frame_classes=None,
+        frame_embeds_no_norm=None):
+
+        # mask feature projection
+        mask_features_shape = mask_features.shape
+        mask_features = self.mask_feature_proj(mask_features.flatten(0, 1)).reshape(*mask_features_shape)  # (b, t, c, h, w)
+
+        # frame_embeds = frame_embeds.permute(2, 3, 0, 1)  # t, q, b, c
+        # if frame_embeds_no_norm is not None:
+        #     frame_embeds_no_norm = frame_embeds_no_norm.permute(2, 3, 0, 1)  # t, q, b, c
+        n_frame, n_q, bs, _ = frame_embeds.size()
+        outputs = []
+        ret_indices = []
+
+        all_frames_references = []
+
+
+        outputs = [None]
+        for i in range(n_frame):
+            output = self.forward_frame(frame_embeds[i], frame_embeds_no_norm[i], frame_classes[i], mask_features, last_output=outputs[-1])
+            outputs.append(output)
+            print(_outputs[i].shape, outputs[i + 1]['tgts'].shape)
+            print(torch.allclose(_outputs[i], outputs[i + 1]['tgts']))
+            print(torch.allclose(all_frames_references[i], outputs[i + 1]['pred_references']))
+        outputs = outputs[1:]
+        exit(0)
+
     def forward(self, frame_embeds, mask_features, resume=False,
                 return_indices=False, frame_classes=None,
                 frame_embeds_no_norm=None):
@@ -198,9 +302,9 @@ class ReferringTracker_noiser(torch.nn.Module):
         mask_features_shape = mask_features.shape
         mask_features = self.mask_feature_proj(mask_features.flatten(0, 1)).reshape(*mask_features_shape)  # (b, t, c, h, w)
 
-        frame_embeds = frame_embeds.permute(2, 3, 0, 1)  # t, q, b, c
-        if frame_embeds_no_norm is not None:
-            frame_embeds_no_norm = frame_embeds_no_norm.permute(2, 3, 0, 1)  # t, q, b, c
+        # frame_embeds = frame_embeds.permute(2, 3, 0, 1)  # t, q, b, c
+        # if frame_embeds_no_norm is not None:
+        #     frame_embeds_no_norm = frame_embeds_no_norm.permute(2, 3, 0, 1)  # t, q, b, c
         n_frame, n_q, bs, _ = frame_embeds.size()
         outputs = []
         ret_indices = []
@@ -334,8 +438,17 @@ class ReferringTracker_noiser(torch.nn.Module):
             self.last_outputs = ms_output
             outputs.append(ms_output[1:])
         outputs = torch.stack(outputs, dim=0)  # (t, l, q, b, c)
-
         all_frames_references = torch.stack(all_frames_references, dim=0)  # (t, q, b, c)
+
+        # outputs1 = [None]
+        # for i in range(n_frame):
+        #     output = self.forward_frame(frame_embeds[i], frame_embeds_no_norm[i], frame_classes[i], mask_features, last_output=outputs[-1])
+        #     outputs1.append(output)
+        #     print(_outputs[i].shape, outputs[i + 1]['tgts'].shape)
+        #     print(torch.allclose(_outputs[i], outputs[i + 1]['tgts']))
+        #     print(torch.allclose(all_frames_references[i], outputs[i + 1]['pred_references']))
+        # outputs1 = outputs1[1:]
+        # exit(0)
 
         mask_features_ = mask_features
         if not self.training:

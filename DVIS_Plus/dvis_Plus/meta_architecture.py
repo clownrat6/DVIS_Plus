@@ -1,6 +1,7 @@
 from typing import Tuple
 import einops
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -588,6 +589,40 @@ class DVIS_Plus_online(MinVIS):
             "use_cl": cfg.MODEL.REFINER.USE_CL,
         }
 
+    def online_preprocess(self, images):
+        images = [(x.to(self.device) - self.pixel_mean) / self.pixel_std for x in images]
+        images = ImageList.from_tensors(images, self.size_divisibility)
+
+        return images
+
+    def online_inference(self, image, old_output):
+        image = self.online_preprocess(image)
+        image = image.tensor
+
+        import time
+
+        start = time.time()
+        features = self.backbone(image)
+        
+        end = time.time()
+        outputs = self.sem_seg_head(features)
+
+        end1 = time.time()
+        object_labels = self._get_instance_labels(outputs['pred_logits'])
+        frame_embds = outputs['pred_embds'][0]  # (t, q, b, c)
+        frame_embds_no_norm = outputs['pred_embds_without_norm'][0]  # (t, q, b, c)
+        mask_features = outputs['mask_features'].unsqueeze(0)
+        output = self.tracker.forward_frame(frame_embds, frame_embds_no_norm, object_labels, mask_features, old_output)
+        end2 = time.time()
+
+        print("=====================================")
+        print("backbone time:", end - start)
+        print("sem_seg_head time:", end1 - end)
+        print("tracker time:", end2 - end1)
+        print("total time:", end2 - start)
+
+        return output
+
     def forward(self, batched_inputs):
         """
         Args:
@@ -637,6 +672,8 @@ class DVIS_Plus_online(MinVIS):
                 images.append(frame.to(self.device))
         images = [(x - self.pixel_mean) / self.pixel_std for x in images]
         images = ImageList.from_tensors(images, self.size_divisibility)
+
+        self.window_inference = False
 
         if not self.training and self.window_inference:
             outputs = self.run_window_inference(images.tensor, window_size=self.window_size)
@@ -747,8 +784,8 @@ class DVIS_Plus_online(MinVIS):
         :return: reordered outputs
         """
         # pred_keys, (b, c, t, q)
-        indices = torch.Tensor(indices).to(torch.int64)  # (t, q)
-        frame_indices = torch.range(0, indices.shape[0] - 1).to(indices).unsqueeze(1).repeat(1, indices.shape[1])
+        indices = torch.from_numpy(np.array(indices)).to(torch.int64)  # (t, q)
+        frame_indices = torch.arange(0, indices.shape[0], device=indices.device).unsqueeze(1).repeat(1, indices.shape[1])
         # pred_masks, shape is (b, q, t, h, w)
         output['pred_masks'][0] = output['pred_masks'][0][indices, frame_indices].transpose(0, 1)
         # pred logits, shape is (b, t, q, c)
@@ -832,7 +869,7 @@ class DVIS_Plus_online(MinVIS):
             labels_per_image = labels[topk_indices]
             topk_indices = topk_indices // self.sem_seg_head.num_classes
             pred_masks = pred_masks[topk_indices]
-            pred_ids = pred_id[topk_indices]
+            pred_ids = pred_id[topk_indices.cpu()]
 
             # interpolation to original image size
             pred_masks = F.interpolate(
