@@ -9,21 +9,24 @@ try:
     from shapely.errors import ShapelyDeprecationWarning
     import warnings
     warnings.filterwarnings('ignore', category=ShapelyDeprecationWarning)
-    warnings.filterwarnings('ignore', category=UserWarning)
-    warnings.filterwarnings('ignore', category=RuntimeWarning)
 except:
     pass
 
+import os
 import copy
 import itertools
 import logging
-import os
+import queue
+import random
+import threading
+from collections.abc import MutableMapping, Sequence
 
 from collections import OrderedDict
 from typing import Any, Dict, List, Set
 
 import torch
-torch.multiprocessing.set_sharing_strategy('file_system')
+from torch.utils.data import Sampler
+import numpy as np
 
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
@@ -59,6 +62,7 @@ from dvis_Plus import (
     add_minvis_config,
     add_dvis_config,
     add_ctvis_config,
+    get_detection_dataset_dicts,
     build_combined_loader,
     build_detection_train_loader,
     build_detection_test_loader,
@@ -67,6 +71,127 @@ from dvis_Plus import (
 )
 
 from dvis_daq.config import add_daq_config
+
+class TrainingSampler(Sampler):
+    def __init__(self, size: int, shuffle: bool = True, seed: int = 42):
+        self._size = size
+        self._shuffle = shuffle
+
+        self._seed = seed
+        self._rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        self._world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+    def __iter__(self):
+        yield from itertools.islice(self._infinite_indices(), self._rank, None, self._world_size)
+
+    def _infinite_indices(self):
+        g = torch.Generator()
+        g.manual_seed(self._seed)
+        while True:
+            if self._shuffle:
+                yield from torch.randperm(self._size, generator=g).tolist()
+            else:
+                yield from torch.arange(self._size).tolist()
+
+
+def set_seed(seed=42):
+    """
+    Set the random seed for reproducible results.
+
+    :param seed: An integer value to be used as the random seed.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # for multi-GPU setups
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+
+def to_cuda(packed_data):
+    if isinstance(packed_data, bytes):
+        return packed_data
+
+    if isinstance(packed_data, torch.Tensor):
+        packed_data = packed_data.to(device="cuda", non_blocking=True)
+    elif isinstance(packed_data, (int, float, str, bool, complex)):
+        packed_data = packed_data
+    elif isinstance(packed_data, MutableMapping):
+        for key, value in packed_data.items():
+            packed_data[key] = to_cuda(value)
+    elif isinstance(packed_data, Sequence):
+        try:
+            for i, value in enumerate(packed_data):
+                packed_data[i] = to_cuda(value)
+        except TypeError:
+            pass
+    return packed_data
+
+
+class CUDADataLoader:
+
+    def __init__(self, dataloader):
+        self.dataloader = dataloader
+
+        self.stream = torch.cuda.Stream() # create a new cuda stream in each process
+        # setting a queue for storing prefetched data
+        self.queue = queue.Queue(16)
+        # 
+        self.iter = dataloader.__iter__()
+        # starting a new thread to prefetch data
+        def data_to_cuda_then_queue():
+            while True:
+                try:
+                    self.preload()
+                except StopIteration:
+                    break
+            # NOTE: end flag for the queue
+            self.queue.put(None)
+        self.cuda_thread = threading.Thread(target=data_to_cuda_then_queue, args=())
+        self.cuda_thread.daemon = True
+
+        # NOTE: preload several batch of data
+        (self.preload() for _ in range(8))
+        self.cuda_thread.start()
+
+    def preload(self):
+        batch = next(self.iter)
+        if batch is None:
+            return None
+        torch.cuda.current_stream().wait_stream(self.stream)  # wait tensor to put on GPU
+        with torch.cuda.stream(self.stream):
+            batch = to_cuda(batch)
+            # batch = batch.to(device="cuda", non_blocking=True)
+        self.queue.put(batch)
+
+    def __len__(self):
+        return len(self.dataloader)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        next_item = self.queue.get()
+        # NOTE: __iter__ will be stopped when __next__ raises StopIteration 
+        if next_item is None:
+            raise StopIteration
+        return next_item
+
+    def __del__(self):
+        # NOTE: clean up the thread
+        try:
+            self.cuda_thread.join(timeout=10)
+        finally:
+            if self.cuda_thread.is_alive():
+                self.cuda_thread._stop()
+        # NOTE: clean up the stream
+        self.stream.synchronize()
+        # NOTE: clean up the queue
+        self.queue.queue.clear()
+
 
 class Trainer(DefaultTrainer):
     """
@@ -82,13 +207,10 @@ class Trainer(DefaultTrainer):
         script and do not have to worry about the hacky if-else logic here.
         """
         if output_folder is None:
-            output_folder = os.path.join(cfg.OUTPUT_DIR, "inference")
-            os.makedirs(output_folder, exist_ok=True)
+            output_folder = os.path.join(cfg.OUTPUT_DIR, dataset_name)
+        os.makedirs(output_folder, exist_ok=True)
 
-        if cfg.MODEL.MASK_FORMER.TEST.TASK == "vos":
-            return None
-
-        evaluator_dict = {'vis': YTVISEvaluator, 'vss': VSSEvaluator, 'vps': VPSEvaluator, 'mots': UniYTVISEvaluator}
+        evaluator_dict = {'vis': YTVISEvaluator, 'vss': VSSEvaluator, 'vps': VPSEvaluator}
         assert cfg.MODEL.MASK_FORMER.TEST.TASK in evaluator_dict.keys()
         return evaluator_dict[cfg.MODEL.MASK_FORMER.TEST.TASK](dataset_name, cfg, True, output_folder)
 
@@ -115,17 +237,18 @@ class Trainer(DefaultTrainer):
 
         if len(mappers) == 1:
             mapper = mappers[0]
-            return build_detection_train_loader(cfg, mapper=mapper, dataset_name=cfg.DATASETS.TRAIN[0])
+            train_loader = build_detection_train_loader(cfg, mapper=mapper, dataset_name=cfg.DATASETS.TRAIN[0])
         else:
             loaders = [
                 build_detection_train_loader(cfg, mapper=mapper, dataset_name=dataset_name)
                 for mapper, dataset_name in zip(mappers, cfg.DATASETS.TRAIN)
             ]
             combined_data_loader = build_combined_loader(cfg, loaders, cfg.DATASETS.DATASET_RATIO)
-            return combined_data_loader
+            train_loader = combined_data_loader
+        return CUDADataLoader(train_loader)
 
     @classmethod
-    def build_test_loader(cls, cfg, dataset_name, dataset_type):
+    def build_test_loader(cls, cfg, dataset_name, dataset_type='video_instance'):
         mapper_dict = {
             'video_instance': YTVISDatasetMapper,
             'video_panoptic': PanopticDatasetVideoMapper,
@@ -135,7 +258,8 @@ class Trainer(DefaultTrainer):
         if dataset_type not in mapper_dict.keys():
             raise NotImplementedError
         mapper = mapper_dict[dataset_type](cfg, is_train=False)
-        return build_detection_test_loader(cfg, dataset_name, mapper=mapper)
+        test_loader = build_detection_test_loader(cfg, dataset_name, mapper=mapper)
+        return CUDADataLoader(test_loader)
 
     @classmethod
     def build_lr_scheduler(cls, cfg, optimizer):
@@ -195,6 +319,7 @@ class Trainer(DefaultTrainer):
                 if isinstance(module, torch.nn.Embedding):
                     hyperparams["weight_decay"] = weight_decay_embed
                 params.append({"params": [value], **hyperparams})
+
         def maybe_add_full_model_gradient_clipping(optim):
             # detectron2 doesn't have full model gradient clipping now
             clip_norm_val = cfg.SOLVER.CLIP_GRADIENTS.CLIP_VALUE
@@ -227,8 +352,12 @@ class Trainer(DefaultTrainer):
             optimizer = maybe_add_gradient_clipping(cfg, optimizer)
         return optimizer
 
+    def test(self, cfg, model, evaluators=None):
+        evaluators = [self.build_evaluator(cfg, dataset_name, output_folder=os.path.join(cfg.OUTPUT_DIR, f"model_{self.iter:07d}", dataset_name)) for dataset_name in cfg.DATASETS.TEST]
+        return super().test(cfg, model, evaluators)
+
     @classmethod
-    def test(cls, cfg, model, evaluators=None):
+    def eval(cls, cfg, model, evaluators=None):
         """
         Evaluate the given model. The given model is expected to already contain
         weights to evaluate.
@@ -241,42 +370,27 @@ class Trainer(DefaultTrainer):
         Returns:
             dict: a dict of result metrics
         """
-        from torch.cuda.amp import autocast
         logger = logging.getLogger(__name__)
         if isinstance(evaluators, DatasetEvaluator):
             evaluators = [evaluators]
         if evaluators is not None:
-            assert len(cfg.DATASETS.TEST) == len(evaluators), "{} != {}".format(
-                len(cfg.DATASETS.TEST), len(evaluators)
-            )
+            assert len(cfg.DATASETS.TEST) == len(evaluators), "{} != {}".format(len(cfg.DATASETS.TEST), len(evaluators))
+        else:
+            evaluators = [cls.build_evaluator(cfg, dataset_name, output_folder=os.path.join(cfg.OUTPUT_DIR, dataset_name)) for dataset_name in cfg.DATASETS.TEST]
 
         results = OrderedDict()
         for idx, dataset_name in enumerate(cfg.DATASETS.TEST):
-            dataset_type = cfg.DATASETS.DATASET_TYPE_TEST[idx]
-            data_loader = cls.build_test_loader(cfg, dataset_name, dataset_type)
+            data_loader = cls.build_test_loader(cfg, dataset_name)
             # When evaluators are passed in as arguments,
             # implicitly assume that evaluators can be created before data_loader.
-            if evaluators is not None:
-                evaluator = evaluators[idx]
-            else:
-                try:
-                    evaluator = cls.build_evaluator(cfg, dataset_name)
-                except NotImplementedError:
-                    logger.warn(
-                        "No evaluator found. Use `DefaultTrainer.test(evaluators=)`, "
-                        "or implement its `build_evaluator` method."
-                    )
-                    results[dataset_name] = {}
-                    continue
-            with autocast():
+            evaluator = evaluators[idx]
+            with torch.amp.autocast("cuda"):
                 results_i = inference_on_dataset(model, data_loader, evaluator)
             results[dataset_name] = results_i
             if comm.is_main_process():
                 assert isinstance(
-                    results_i, dict
-                ), "Evaluator must return a dict on the main process. Got {} instead.".format(
-                    results_i
-                )
+                    results_i,
+                    dict), "Evaluator must return a dict on the main process. Got {} instead.".format(results_i)
                 logger.info("Evaluation results for {} in csv format:".format(dataset_name))
                 print_csv_format(results_i)
 
@@ -300,6 +414,14 @@ def setup(args):
     add_daq_config(cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
+
+    if 'OUTPUT_DIR' not in args.opts:
+        work_dir_prefix = os.path.dirname(args.config_file).replace('configs/', '')
+        work_dir_suffix = os.path.splitext(os.path.basename(args.config_file))[0]
+        cfg.OUTPUT_DIR = f'work_dirs/{work_dir_prefix}/{work_dir_suffix}'
+        if args.eval_only:
+            cfg.OUTPUT_DIR = os.path.join(cfg.OUTPUT_DIR, 'eval')
+
     cfg.freeze()
     default_setup(cfg, args)
     # Setup logger for "mask_former" module
@@ -309,6 +431,7 @@ def setup(args):
 
 
 def main(args):
+    set_seed(42)
     cfg = setup(args)
 
     if args.eval_only:
@@ -316,7 +439,7 @@ def main(args):
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
-        res = Trainer.test(cfg, model)
+        res = Trainer.eval(cfg, model)
         if cfg.TEST.AUG.ENABLED:
             raise NotImplementedError
         if comm.is_main_process():
@@ -330,7 +453,6 @@ def main(args):
 
 if __name__ == "__main__":
     args = default_argument_parser().parse_args()
-    #args.dist_url = 'tcp://127.0.0.1:50263'
     print("Command Line Args:", args)
     launch(
         main,

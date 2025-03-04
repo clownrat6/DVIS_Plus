@@ -228,6 +228,123 @@ class DVIS_DAQ_online(MinVIS):
             "cfg": cfg,
         }
 
+    def online_preprocess(self, images):
+        images = [(x.to(self.device) - self.pixel_mean) / self.pixel_std for x in images]
+        images = ImageList.from_tensors(images, self.size_divisibility)
+
+        return images
+
+    def online_inference(self, idx, image):
+        image = self.online_preprocess(image)
+        image = image.tensor
+        # window_size = 1
+        # num_frames = len(images_tensor)
+        # to_store = "cpu"
+        # iters = len(images_tensor) // window_size
+        # if len(images_tensor) % window_size != 0:
+        #     iters += 1
+        # for i in range(iters):
+        # start_idx = i * window_size
+        # end_idx = (i + 1) * window_size
+        # image = images_tensor[start_idx:end_idx]
+        # segmenter inference
+        features = self.backbone(image)
+        out = self.sem_seg_head(features)
+        # remove unnecessary variables to save GPU memory
+        # del features['res2'], features['res3'], features['res4'], features['res5']
+        # for j in range(len(out['aux_outputs'])):
+        #     del out['aux_outputs'][j]['pred_masks'], out['aux_outputs'][j]['pred_logits']
+        # referring tracker inference
+        frame_embds = out['pred_embds']  # (b, c, t, q)
+        mask_features = out['mask_features'].unsqueeze(0)  # as B == 1
+        pred_logits, pred_masks = out["pred_logits"].flatten(0, 1), out["pred_masks"].transpose(1, 2).flatten(0, 1)
+
+        B, _, T, Q = frame_embds.shape
+        H, W = mask_features.shape[-2:]
+
+        pred_scores = torch.max(pred_logits.softmax(dim=-1)[:, :, :-1], dim=-1)[0]
+        valid_masks = pred_scores > self.aux_inference_select_thr
+        new_pred_logits, new_pred_masks, new_valid_masks = [], [], []
+        for t in range(T):
+            new_pred_logits.append([pred_logits[b * T + t] for b in range(B)])
+            new_pred_masks.append([pred_masks[b * T + t] for b in range(B)])
+            new_valid_masks.append([valid_masks[b * T + t] for b in range(B)])
+        frame_info = {"pred_logits": new_pred_logits, "pred_masks": new_pred_masks, "valid": new_valid_masks,
+                        "seg_query_feat": self.sem_seg_head.predictor.query_feat,
+                        "seg_query_embed": self.sem_seg_head.predictor.query_embed}
+
+        if idx == 0:
+            self.tracker.inference(frame_embds, mask_features, frame_info,
+                                    idx, to_store="cpu")
+        else:
+            self.tracker.inference(frame_embds, mask_features, frame_info,
+                                    idx, resume=True, to_store="cpu")
+
+        # logits_list = []
+        # full_logits_list = []
+        # masks_list = []
+        # seq_id_list = []
+        # dead_seq_id_list = []
+        # padding_mask_list = []
+        # for seq_id, ins_seq in self.tracker.video_ins_hub.items():
+        #     if len(ins_seq.pred_masks) < self.noise_frame_num:
+        #         # if ins_seq.sT + len(ins_seq.pred_masks) == num_frames, which means this object appeared at the end of
+        #         # this clip and cloud be exists in the next clip.
+        #         if ins_seq.sT + len(ins_seq.pred_masks) < video_start_idx + num_frames:
+        #             continue
+        #     full_masks = torch.ones(num_frames, H, W).to(torch.float32).to(to_store) * -1e4
+        #     full_logits = torch.ones(num_frames, self.sem_seg_head.num_classes + 1).to(torch.float32).to("cuda") * -1e4
+        #     full_logits[:, -1] = 1.
+        #     padding_mask = torch.ones(size=(num_frames, )) > 0
+        #     seq_logits = []
+        #     seq_start_t = ins_seq.sT
+        #     for j in range(len(ins_seq.pred_masks)):
+        #         if seq_start_t + j < video_start_idx:
+        #             continue
+        #         re_j = seq_start_t + j - video_start_idx
+        #         full_masks[re_j, :, :] = ins_seq.pred_masks[j]
+        #         full_logits[re_j, :] = ins_seq.pred_logits[j]
+        #         padding_mask[re_j] = False
+        #         seq_logits.append(ins_seq.pred_logits[j])
+        #     if len(seq_logits) == 0:
+        #         continue
+        #     seq_logits = torch.stack(seq_logits, dim=0).mean(0)  # n, c -> c
+        #     logits_list.append(seq_logits)
+        #     masks_list.append(full_masks)
+        #     full_logits_list.append(full_logits)
+        #     padding_mask_list.append(padding_mask)
+        #     assert ins_seq.gt_id == seq_id
+        #     seq_id_list.append(seq_id)
+        #     if ins_seq.dead:
+        #         dead_seq_id_list.append(seq_id)
+
+        # for seq_id in dead_seq_id_list:  # for handling large long videos, saving memory
+        #     self.tracker.video_ins_hub.pop(seq_id)
+
+        # if len(logits_list) > 0:
+        #     pred_cls = torch.stack(logits_list, dim=0)[None, ...]  # b, n, c
+        #     pred_masks = torch.stack(masks_list, dim=0)[None, ...]  # b, n, t, h, w
+        #     pred_ids = torch.as_tensor(seq_id_list).to(torch.int64)[None, :]  # b, n
+        #     padding_masks = torch.stack(padding_mask_list, dim=0)[None, ...]  # b, n, t
+        #     full_logits_tensor = torch.stack(full_logits_list)[None, ...]  # b, n, t, c
+        # else:
+        #     pred_cls = []
+        #     pred_masks = []
+        #     pred_ids = []
+        #     padding_masks = []
+        #     full_logits_tensor = []
+
+        # outputs = {
+        #     "pred_logits": pred_cls,
+        #     "pred_masks": pred_masks,
+        #     "pred_ids": pred_ids,
+        #     "shape": (H, W),
+        #     "padding_masks": padding_masks,
+        #     "full_logits": full_logits_tensor,
+        # }
+
+        # return outputs
+
     def forward(self, batched_inputs):
         if not self.training:
             return self.inference(batched_inputs)
@@ -488,7 +605,9 @@ class DVIS_DAQ_online(MinVIS):
     def run_window_inference(self, images_tensor, window_size=30, long_video_start_fidx=-1):
         video_start_idx = long_video_start_fidx if long_video_start_fidx >= 0 else 0
 
-        window_size = 5
+        import time
+
+        window_size = 1
         num_frames = len(images_tensor)
         to_store = "cpu"
         iters = len(images_tensor) // window_size
@@ -497,9 +616,11 @@ class DVIS_DAQ_online(MinVIS):
         for i in range(iters):
             start_idx = i * window_size
             end_idx = (i + 1) * window_size
+            start = time.time()
             # segmenter inference
             features = self.backbone(images_tensor[start_idx:end_idx])
             out = self.sem_seg_head(features)
+            end = time.time()
             # remove unnecessary variables to save GPU memory
             del features['res2'], features['res3'], features['res4'], features['res5']
             for j in range(len(out['aux_outputs'])):
@@ -508,6 +629,7 @@ class DVIS_DAQ_online(MinVIS):
             frame_embds = out['pred_embds']  # (b, c, t, q)
             mask_features = out['mask_features'].unsqueeze(0)  # as B == 1
             pred_logits, pred_masks = out["pred_logits"].flatten(0, 1), out["pred_masks"].transpose(1, 2).flatten(0, 1)
+            end1 = time.time()
 
             B, _, T, Q = frame_embds.shape
             H, W = mask_features.shape[-2:]
@@ -522,6 +644,7 @@ class DVIS_DAQ_online(MinVIS):
             frame_info = {"pred_logits": new_pred_logits, "pred_masks": new_pred_masks, "valid": new_valid_masks,
                           "seg_query_feat": self.sem_seg_head.predictor.query_feat,
                           "seg_query_embed": self.sem_seg_head.predictor.query_embed}
+            end2 = time.time()
 
             if i != 0 or self.keep:
                 self.tracker.inference(frame_embds, mask_features, frame_info,
@@ -529,6 +652,10 @@ class DVIS_DAQ_online(MinVIS):
             else:
                 self.tracker.inference(frame_embds, mask_features, frame_info,
                                        video_start_idx + start_idx, to_store=to_store)
+
+            end3 = time.time()
+
+            print(f"segmenter time: {end - start}, tracker time: {end3 - end2}, total time: {end3 - start}")
 
         logits_list = []
         full_logits_list = []
