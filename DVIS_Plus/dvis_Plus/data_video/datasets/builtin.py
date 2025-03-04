@@ -64,6 +64,16 @@ _PREDEFINED_SPLITS_COCO_VIDEO = {
 }
 
 
+_PREDEFINED_SPLITS_HQYTVIS = {
+    "hqytvis_train": ("ytvis_2019/train/JPEGImages",
+                      "hqytvis/ytvis_hq-train.json"),
+    "hqytvis_val":   ("ytvis_2019/train/JPEGImages",
+                      "hqytvis/ytvis_hq-valid.json"),
+    "hqytvis_test":  ("ytvis_2019/train/JPEGImages",
+                      "hqytvis/ytvis_hq-test.json"),
+}
+
+
 def register_all_ytvis_2019(root):
     for key, (image_root, json_file) in _PREDEFINED_SPLITS_YTVIS_2019.items():
         # Assume pre-defined datasets live in `./datasets`.
